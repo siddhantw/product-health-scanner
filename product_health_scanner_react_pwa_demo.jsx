@@ -11,9 +11,12 @@ import { BrowserMultiFormatReader } from '@zxing/browser';
  * - Announces the score using Web Speech (SpeechSynthesis)
  * - Displays an animated UI with score, pros, cons; updates live
  * - Optional barcode scanning mode (ZXing) for future nutrition lookup
+/* Product Health Scanner
+ * Camera-based heuristic scoring UI (client-only)
+ * Re-Engineered by Siddhant Wadhwani
  */
 
-// Simple helper: map 0..1 to 1..10
+// Helper: map 0..1 to 1..10
 const greenToScore = (g) => {
   const s = Math.round(Math.min(1, Math.max(0, g)) * 9) + 1; // 1..10
   return s;
@@ -36,7 +39,7 @@ export default function App() {
   const rafRef = useRef(null);
   const barcodeReaderRef = useRef(null);
 
-  // Start camera
+  // Delayed camera start until first interaction for better autoplay / speech compatibility
   useEffect(() => {
     let mounted = true;
     async function startCamera() {
@@ -109,10 +112,10 @@ export default function App() {
     };
   }, [barcodeMode]);
 
-  // Core loop: draw video to hidden canvas and analyze every N ms
+  // Core loop
   useEffect(() => {
     let last = 0;
-    const interval = 300; // ms between analyses (update faster for higher responsiveness)
+    const interval = 400; // slower sampling to reduce fluctuations
 
     const step = (timestamp) => {
       if (!videoRef.current || videoRef.current.readyState < 2) {
@@ -130,34 +133,33 @@ export default function App() {
     return () => cancelAnimationFrame(rafRef.current);
   }, []);
 
-  // Capture current frame and run a lightweight analysis
-  const captureAndAnalyze = async () => {
+  const captureAndAnalyze = () => {
     const video = videoRef.current;
     const canvas = canvasRef.current;
     if (!video || !canvas) return;
     const w = video.videoWidth;
     const h = video.videoHeight;
     if (!w || !h) return;
+    // Use full frame for better signal (previously cropped center)
     canvas.width = w;
     canvas.height = h;
     const ctx = canvas.getContext('2d');
-    // draw a smaller area centered for speed
-    const sx = Math.floor(w * 0.25);
-    const sy = Math.floor(h * 0.25);
-    const sw = Math.floor(w * 0.5);
-    const sh = Math.floor(h * 0.5);
-    ctx.drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh);
+    ctx.drawImage(video, 0, 0, w, h, 0, 0, w, h);
 
-    // Get pixel data and compute simple "health" heuristic
-    const img = ctx.getImageData(0, 0, sw, sh);
+    const sampleScale = 0.5; // downscale for performance
+    const sw = Math.max(1, Math.floor(w * sampleScale));
+    const sh = Math.max(1, Math.floor(h * sampleScale));
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = sw;
+    tempCanvas.height = sh;
+    const tctx = tempCanvas.getContext('2d');
+    tctx.drawImage(canvas, 0, 0, w, h, 0, 0, sw, sh);
+    const img = tctx.getImageData(0, 0, sw, sh);
     const { data } = img;
-    let rSum = 0,
-      gSum = 0,
-      bSum = 0,
-      count = 0;
-    // sample pixels to speed up
-    const step = 4 * 6; // every 6th pixel
-    for (let i = 0; i < data.length; i += step) {
+
+    let rSum = 0, gSum = 0, bSum = 0, count = 0;
+    const stepPix = 4 * 4; // every 4th pixel now (denser sampling)
+    for (let i = 0; i < data.length; i += stepPix) {
       rSum += data[i];
       gSum += data[i + 1];
       bSum += data[i + 2];
@@ -167,78 +169,95 @@ export default function App() {
     const gAvg = gSum / count / 255;
     const bAvg = bSum / count / 255;
 
-    // Heuristic: greener products (fresh produce, plants, vegetables) => healthier.
-    // Also reduce score if image is very processed-looking (high red/b channel ratio or high saturation)
-    const greenBias = gAvg;
-    const redPenalty = Math.max(0, rAvg - gAvg) * 0.5;
-    const bluePenalty = Math.max(0, bAvg - gAvg) * 0.2;
-    const rawScore = Math.max(0, greenBias - redPenalty - bluePenalty);
-    const mapped = greenToScore(rawScore);
+    // Improved raw score emphasizing green balance but penalizing oversaturation + red dominance
+    const greenDominance = gAvg / (rAvg + gAvg + bAvg + 1e-6); // 0..1
+    const balancePenalty = Math.abs(rAvg - bAvg) * 0.15; // encourage balanced non-green channels
+    const rawScore = Math.max(0, greenDominance - balancePenalty);
 
-    // Confidence: how strongly green dominates
-    const conf = Math.min(1, Math.abs(gAvg - (rAvg + bAvg) / 2) * 2);
+    // Push into rolling history
+    const hist = historyRef.current;
+    hist.push(rawScore);
+    if (hist.length > 15) hist.shift();
 
-    // Build pros/cons using simple rule-based descriptions
-    const { pros: newPros, cons: newCons } = describeFromScore(mapped);
+    // Compute smoothed score (median of last N for robustness)
+    const sorted = [...hist].sort((a,b) => a - b);
+    const median = sorted[Math.floor(sorted.length / 2)];
+    const mapped = greenToScore(median);
 
-    // Update state only when significant change to reduce chatter
-    setScore((prev) => {
+    // Confidence: combine green dominance distance from neutral (1/3) + chroma variance + history length
+    const neutral = 1/3;
+    const dominanceComponent = Math.min(1, Math.abs(greenDominance - neutral) * 2.2);
+    const chroma = Math.sqrt(((rAvg - gAvg) ** 2 + (gAvg - bAvg) ** 2 + (rAvg - bAvg) ** 2) / 3);
+    const chromaComponent = Math.min(1, chroma * 1.8);
+    const stability = 1 - (sorted[sorted.length - 1] - sorted[0]); // narrower range => closer to 1
+    const stabilityComponent = Math.max(0, Math.min(1, stability));
+    let conf = (dominanceComponent * 0.45 + chromaComponent * 0.25 + stabilityComponent * 0.30);
+    // Boost once we have enough samples
+    if (hist.length >= 10) conf = Math.min(1, conf + 0.1);
+    // Floor + scale
+    conf = Math.max(0.3, conf);
+
+    const { pros: newPros, cons: newCons } = describeFromScore(mapped, conf);
+
+    // Stable update logic: require persistence of change
+    setScore(prev => {
       if (prev === null || Math.abs(mapped - prev) >= 1) {
-        if (announceOnChange) speakScore(mapped);
+        // track persistence
+        if (stableRef.current === mapped) {
+          consecutiveStableRef.current += 1;
+        } else {
+          stableRef.current = mapped;
+          consecutiveStableRef.current = 1;
+        }
+        if (voiceEnabled && userActivatedAudio && consecutiveStableRef.current >= 2 && mapped !== prev) {
+          speakScore(mapped);
+        }
+        return mapped;
+      } else {
+        // no big change; keep existing
+        return prev;
       }
-      return mapped;
     });
+
     setPros(newPros);
     setCons(newCons);
     setLastUpdate(new Date().toLocaleTimeString());
     setConfidence(Math.round(conf * 100));
-
-    // --- for real integration: you could send `canvas.toDataURL()` to your backend here ---
-    // Example payload: { image_base64: canvas.toDataURL('image/jpeg', 0.7) }
   };
 
-  // Turn the numeric score into pros & cons
-  const describeFromScore = (s) => {
+  const describeFromScore = (s, conf) => {
     const pros = [];
     const cons = [];
     if (s >= 8) {
-      pros.push('High fresh/plant-based content');
-      pros.push('Low visible processing or additives');
-      cons.push('May be perishable — check storage');
+      pros.push('High natural indicators');
+      pros.push('Low visible processing');
+      cons.push('Perishable — ensure proper storage');
     } else if (s >= 6) {
-      pros.push('Moderately healthy choice');
-      pros.push('Likely contains real ingredients');
-      cons.push('May include added sugars or oils');
+      pros.push('Generally balanced visual profile');
+      pros.push('Some natural components evident');
+      cons.push('Possible added ingredients');
     } else if (s >= 4) {
-      pros.push('May contain some natural ingredients');
-      cons.push('Visible signs of processing or colouring');
-      cons.push('Check labels for additives');
+      pros.push('Contains mixed indicators');
+      cons.push('Signs of processing or additives');
+      cons.push('Review packaging details');
     } else {
-      pros.push('Convenient or tasty option');
-      cons.push('Likely highly processed');
-      cons.push('Higher sugar/sodium/fats possible');
+      pros.push('Convenient option');
+      cons.push('Likely processed');
+      cons.push('Check sugar / sodium / fats');
     }
-
-    // Add nuance based on confidence
-    if (confidence < 30) {
-      cons.push('Low visual confidence — move camera closer');
-    }
+    if (conf * 100 < 50) cons.push('Low visual confidence — move closer / adjust lighting');
     return { pros, cons };
   };
 
-  // Voice announce the score using Web Speech API
   const speakScore = (s) => {
-    const text = `Health score ${s} out of 10`;
-    // Prefer server-side TTS if you want ChatGPT Voice — this is a browser fallback demo
     try {
       const synth = window.speechSynthesis;
       if (!synth) return;
-      // cancel previous
       synth.cancel();
-      const utter = new SpeechSynthesisUtterance(text);
-      // voice selection - keep default for compatibility
-      utter.rate = 1.0;
-      utter.pitch = 1.0;
+      const utter = new SpeechSynthesisUtterance(`Health score ${s} out of 10`);
+      utter.rate = 1;
+      utter.pitch = 1;
+      utter.volume = 1;
       synth.speak(utter);
     } catch (e) {
       console.warn('TTS failed', e);
@@ -265,6 +284,11 @@ export default function App() {
     link.click();
   };
 
+  const toggleVoice = () => {
+    setVoiceEnabled(v => !v);
+    if (!userActivatedAudio) setUserActivatedAudio(true); // first user interaction unlocks speech
+  };
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 to-indigo-900 text-white flex flex-col items-center p-4">
       {/* Accessibility live region for score updates */}
@@ -281,10 +305,10 @@ export default function App() {
             <canvas ref={canvasRef} className="hidden" />
             <div className="absolute bottom-3 left-3 z-20 flex gap-2 flex-wrap pr-3">
               <button
-                onClick={() => setAnnounceOnChange((v) => !v)}
+                onClick={toggleVoice}
                 className="bg-white/10 px-3 py-1 rounded-md text-sm backdrop-blur"
               >
-                {announceOnChange ? 'Voice: On' : 'Voice: Off'}
+                {voiceEnabled ? 'Voice: On' : 'Voice: Off'}
               </button>
               <button onClick={takeSnapshot} className="bg-white/10 px-3 py-1 rounded-md text-sm">
                 Snapshot
@@ -304,13 +328,15 @@ export default function App() {
             )}
           </div>
 
-          <div className="md:w-1/2 p-6">
-            <h2 className="text-2xl font-bold mb-1">Product Health Scanner</h2>
-            <div className="text-xs mb-3 opacity-70">Re-Engineered by Siddhant Wadhwani</div>
-            <p className="text-sm opacity-80 mb-4">Point your camera at a product. Health score updates live.</p>
+          <div className="md:w-1/2 p-6 flex flex-col">
+            <h1 className="text-2xl font-bold mb-1">Product Health Scanner</h1>
+            <p className="text-sm opacity-80 mb-4">Point the camera at a product. A stabilized health score updates live.</p>
 
-            <div className="flex items-center gap-4 mb-4">
-              <div className="w-28 h-28 rounded-full bg-white/5 flex items-center justify-center text-4xl font-bold animate-pulse">
+            <div className="flex items-center gap-4 mb-5">
+              <div
+                className="w-32 h-32 rounded-full bg-white/5 flex items-center justify-center text-4xl font-bold transition-colors"
+                aria-live="polite"
+              >
                 {score ?? '--'}
               </div>
 
@@ -365,16 +391,17 @@ export default function App() {
             </div>
 
             {permissionError && (
-              <div className="mt-4 text-red-400">Camera error: {permissionError}</div>
+              <div className="mt-2 text-red-400 text-sm">Camera error: {permissionError}</div>
             )}
+
+            <div className="mt-auto text-[10px] tracking-wider text-white/30">© {new Date().getFullYear()}</div>
           </div>
         </div>
       </div>
 
-      <div className="max-w-3xl mt-6 text-xs text-white/60">
-        Tip: For improved results, point the camera at the product label and get closer to capture details. This demo uses visual heuristics — integrate a vision model for reliable results.
+      <div className="max-w-5xl mt-6 text-xs text-white/60 text-center">
+        For best results: ensure steady framing, diffuse lighting, and move closer if confidence is low.
       </div>
-      <div className="mt-4 text-[10px] uppercase tracking-wider text-white/30">Re-Engineered by Siddhant Wadhwani</div>
     </div>
   );
 }
