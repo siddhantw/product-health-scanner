@@ -11,12 +11,16 @@ A lightweight React + Vite Progressive Web App that uses the device camera to es
 - Snapshot download
 - Tailwind CSS UI + responsive layout
 - Installable PWA (manifest included)
+- Offline caching + network status indicator
+- Optional barcode scanning mode (ZXing) (future nutrition DB link)
+- Accessibility: ARIA live region for score
 
 ## Tech Stack
 - React 18 + Vite
 - Tailwind CSS
 - Browser APIs: MediaDevices, Canvas, SpeechSynthesis
-- Netlify (deployment) + optional Functions (future API integration)
+- ZXing for barcode (optional toggle)
+- Netlify (deployment) + Functions scaffold (future API integration)
 
 ## Quick Start
 ```bash
@@ -51,24 +55,17 @@ netlify deploy --prod
 
 ## PWA Notes
 - `manifest.webmanifest` is referenced in `index.html`.
-- Add icons (`icon-192.png`, `icon-512.png`) at project root or adjust paths.
-- To add offline support, register a service worker (not included yet).
+- Add/replace icons (`/icon-192.png`, `/icon-512.png`) as needed.
+- Offline page `offline.html` served when navigation fails.
 
-## Service Worker (Optional Next Step)
-Create `public/sw.js`, then in `src/main.jsx`:
-```js
-if ('serviceWorker' in navigator) {
-  window.addEventListener('load', () => {
-    navigator.serviceWorker.register('/sw.js').catch(console.error);
-  });
-}
-```
+## Service Worker
+Implements cache-first for app shell + runtime caching for same-origin GET requests, with offline fallback for navigations.
 
 ## Vision / AI Integration (Future)
 Replace the heuristic in `captureAndAnalyze` with an API call:
 1. Convert canvas to blob / base64.
 2. POST to backend (Netlify Function) that calls a Vision + LLM model.
-3. Return JSON: `{ score, pros, cons, confidence }`.
+3. Return JSON: `{ score, pros, cons, confidence, barcode }`.
 4. Update state; optionally stream partial results.
 
 Example (pseudo):
@@ -76,17 +73,35 @@ Example (pseudo):
 const blob = await new Promise(r => canvas.toBlob(r, 'image/jpeg', 0.7));
 const formData = new FormData();
 formData.append('image', blob, 'frame.jpg');
+if (barcode) formData.append('barcode', barcode);
 const resp = await fetch('/api/analyze', { method: 'POST', body: formData });
 const data = await resp.json();
 ```
 
+### Netlify Function Scaffold
+A placeholder function exists in `netlify/functions/analyze.js`.
+Environment variable needed (create `.env`):
+```
+OPENAI_API_KEY=sk-... (or provider key)
+```
+Access in function via `process.env.OPENAI_API_KEY`.
+
+## Environment Variables
+Create a `.env` (NOT committed) based on `.env.example`:
+```
+OPENAI_API_KEY=sk-...your real key...
+```
+Netlify: Site settings > Build & deploy > Environment > Add variable.
+
+The frontend never exposes this key; only the Netlify Function uses it.
+
 ## Environment / Permissions
-- Requires HTTPS (or localhost) for camera on most browsers.
-- Mobile Safari: ensure user interacts before audio (speech) plays.
+- Requires HTTPS (or localhost) for camera.
+- Safari may require first user interaction before speech.
 
 ## Accessibility
-- Voice announcements can be toggled.
-- Consider adding ARIA live regions for screen readers if expanded.
+- Live score announced via ARIA live region (screen reader friendly).
+- Toggle voice for users preferring audible feedback.
 
 ## Security / Privacy Considerations (Real Build)
 - Avoid sending raw frames unless needed.
@@ -95,12 +110,12 @@ const data = await resp.json();
 - Provide user consent + policy disclosures.
 
 ## Enhancements Roadmap
-- Barcode scanning (e.g., jsbarcode / ZXing)
-- Nutrition database lookup
+- Nutrition database lookup (USDA / OpenFoodFacts)
 - User dietary preferences & allergen filters
 - Comparison mode (multiple products)
 - Offline caching of last results
 - Streaming TTS via server
+- Persistent history (IndexedDB)
 
 ## License
 Demo purpose only. Adapt as needed.

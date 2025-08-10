@@ -1,17 +1,9 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
+import { BrowserMultiFormatReader } from '@zxing/browser';
 
-/**
- * Product Health Scanner - React PWA Demo
+/* Product Health Scanner
+ * Camera-based heuristic scoring UI (client-only)
  * Re-Engineered by Siddhant Wadhwani
- * --------------------------------------
- * Single-file React component (export default App)
- * - Uses the device camera (getUserMedia) to stream video
- * - Grabs frames and runs a lightweight 'health heuristic' analysis
- *   (average green channel) to produce a live health score (1-10)
- * - Announces the score using Web Speech (SpeechSynthesis)
- * - Displays an animated UI with score, pros, cons; updates live
- *
- * Replace the analyze logic with a backend call to a Vision model for real use.
  */
 
 // Helper: map 0..1 to 1..10
@@ -19,6 +11,86 @@ const greenToScore = (g) => {
   const s = Math.round(Math.min(1, Math.max(0, g)) * 9) + 1; // 1..10
   return s;
 };
+
+// Robust median utility
+const median = (arr) => {
+  if (!arr.length) return 0;
+  const s = [...arr].sort((a,b)=>a-b);
+  return s[Math.floor(s.length/2)];
+};
+
+// Trimmed mean utility (exclude extremes for stability)
+const trimmedMean = (arr, trim=0.1) => {
+  if (!arr.length) return 0;
+  const s = [...arr].sort((a,b)=>a-b);
+  const k = Math.floor(s.length * trim);
+  const trimmed = s.slice(k, s.length - k || undefined);
+  return trimmed.reduce((a,c)=>a+c,0)/trimmed.length;
+};
+
+// Hook: image analysis & scoring
+function useHealthAnalyzer() {
+  const historyRef = useRef([]);
+  const brightnessHistoryRef = useRef([]);
+  const varianceHistoryRef = useRef([]);
+
+  const analyzeImageData = useCallback((imageData) => {
+    const { data, width, height } = imageData;
+    if (!width || !height) return null;
+    let rSum=0,gSum=0,bSum=0,count=0;
+    const stepPix = 4 * 4;
+    for (let i=0;i<data.length;i+=stepPix){
+      rSum+=data[i]; gSum+=data[i+1]; bSum+=data[i+2]; count++;}
+    const rAvg = rSum/count/255; const gAvg = gSum/count/255; const bAvg = bSum/count/255;
+    const luminance = 0.2126*rAvg + 0.7152*gAvg + 0.0722*bAvg;
+    // variance sample
+    let lSum=0,lSq=0,n=0;
+    for (let i=0;i<data.length;i+=stepPix*12){
+      const r=data[i]/255,g=data[i+1]/255,b=data[i+2]/255; const lum=0.2126*r+0.7152*g+0.0722*b; lSum+=lum; lSq+=lum*lum; n++;}
+    const meanL = lSum/Math.max(1,n);
+    const variance = Math.max(0,(lSq/Math.max(1,n)) - meanL*meanL);
+
+    brightnessHistoryRef.current.push(luminance);
+    if (brightnessHistoryRef.current.length>30) brightnessHistoryRef.current.shift();
+    varianceHistoryRef.current.push(variance);
+    if (varianceHistoryRef.current.length>30) varianceHistoryRef.current.shift();
+
+    const avgBrightness = trimmedMean(brightnessHistoryRef.current,0.15);
+    const avgVariance = trimmedMean(varianceHistoryRef.current,0.15);
+    let lightingState='OK';
+    if (avgBrightness < 0.12) lightingState='Too Dark'; else if (avgBrightness>0.85) lightingState='Too Bright'; else if (avgVariance<0.002) lightingState='Low Texture';
+
+    const greenDominance = gAvg/(rAvg+gAvg+bAvg+1e-6);
+    const balancePenalty = Math.abs(rAvg-bAvg)*0.15;
+    let rawScore = Math.max(0, greenDominance - balancePenalty);
+
+    const hist = historyRef.current; hist.push(rawScore); if (hist.length>25) hist.shift();
+    if (['Too Dark','Too Bright','Low Texture'].includes(lightingState) && hist.length){
+      const prevMed = median(hist); rawScore = prevMed*0.7 + rawScore*0.3; hist[hist.length-1]=rawScore; }
+
+    const sorted=[...hist].sort((a,b)=>a-b); const med=sorted[Math.floor(sorted.length/2)];
+    const iqr = sorted[Math.floor(sorted.length*0.75)] - sorted[Math.floor(sorted.length*0.25)] || 1e-6;
+    const filtered = hist.filter(v=> v>= med-1.5*iqr && v<= med+1.5*iqr);
+    const smoothed = median(filtered.length?filtered:hist);
+    const mapped = greenToScore(smoothed);
+
+    const neutral = 1/3;
+    const dominanceComponent = Math.min(1, Math.abs(greenDominance-neutral)*2.2);
+    const chroma = Math.sqrt(((rAvg-gAvg)**2 + (gAvg-bAvg)**2 + (rAvg-bAvg)**2)/3);
+    const chromaComponent = Math.min(1, chroma*1.8);
+    const stability = 1 - (sorted[sorted.length-1]-sorted[0]);
+    const stabilityComponent = Math.max(0, Math.min(1, stability));
+    let conf = dominanceComponent*0.45 + chromaComponent*0.25 + stabilityComponent*0.30;
+    if (hist.length>=10) conf = Math.min(1, conf+0.1);
+    if (lightingState!=='OK') conf*=0.7; if (avgVariance<0.002) conf*=0.75; conf = Math.max(0.2, Math.min(1, conf));
+
+    const warnings=[]; if (lightingState==='Too Dark') warnings.push('Increase lighting'); if (lightingState==='Too Bright') warnings.push('Reduce glare'); if (lightingState==='Low Texture') warnings.push('Move closer / adjust focus');
+
+    return { mappedScore: mapped, conf, lightingState, warnings };
+  }, []);
+
+  return { analyzeImageData };
+}
 
 export default function App() {
   const videoRef = useRef(null);
@@ -30,44 +102,141 @@ export default function App() {
   const [cons, setCons] = useState([]);
   const [lastUpdate, setLastUpdate] = useState(null);
   const [confidence, setConfidence] = useState(0);
-  const [announceOnChange, setAnnounceOnChange] = useState(true);
+  const [voiceEnabled, setVoiceEnabled] = useState(true);
+  const [userActivatedAudio, setUserActivatedAudio] = useState(false);
+  const [lighting, setLighting] = useState('');
+  const [warnings, setWarnings] = useState([]);
   const rafRef = useRef(null);
+  const stableRef = useRef(null); // last stable spoken score
+  const consecutiveStableRef = useRef(0);
+  const barcodeReaderRef = useRef(null);
+  const [barcode, setBarcode] = useState('');
+  const { analyzeImageData } = useHealthAnalyzer();
+  // API integration scaffold states
+  const [apiMode, setApiMode] = useState(false); // toggle to enable backend
+  const [apiPending, setApiPending] = useState(false);
+  const [apiError, setApiError] = useState('');
+  const [apiModel, setApiModel] = useState('');
+  const lastApiRef = useRef(0);
+  const backoffRef = useRef(0); // ms additional delay after failures
 
-  // Start camera
-  useEffect(() => {
-    let mounted = true;
-    async function startCamera() {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } },
-          audio: false,
-        });
-        if (!mounted) return;
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          await videoRef.current.play();
-          setRunning(true);
-        }
-      } catch (err) {
-        console.error('camera error', err);
-        setPermissionError(err.message || String(err));
-      }
+  // Helper: encode current frame (resized) to base64 JPEG (raw base64 without header)
+  const encodeFrame = (srcCanvas) => new Promise((resolve) => {
+    const maxSide = 512;
+    const c = document.createElement('canvas');
+    let { width, height } = srcCanvas;
+    if (width > maxSide || height > maxSide) {
+      const scale = Math.min(maxSide / width, maxSide / height);
+      width = Math.round(width * scale); height = Math.round(height * scale);
     }
-    startCamera();
-    return () => {
-      mounted = false;
-      if (videoRef.current && videoRef.current.srcObject) {
-        const tracks = videoRef.current.srcObject.getTracks();
-        tracks.forEach((t) => t.stop());
+    c.width = width; c.height = height;
+    const ctx = c.getContext('2d');
+    ctx.drawImage(srcCanvas, 0, 0, c.width, c.height);
+    c.toBlob((blob) => {
+      if (!blob) return resolve(null);
+      const fr = new FileReader();
+      fr.onload = () => {
+        const result = fr.result || '';
+        const base64 = result.toString().split(',')[1] || '';
+        resolve(base64);
+      };
+      fr.readAsDataURL(blob);
+    }, 'image/jpeg', 0.7);
+  });
+
+  const attemptApiAnalyze = useCallback(async (canvas, barcodeVal) => {
+    if (!apiMode || apiPending || !navigator.onLine) return;
+    const now = Date.now();
+    const baseInterval = 2500; // min ms between calls
+    if (now - lastApiRef.current < baseInterval + backoffRef.current) return;
+    lastApiRef.current = now;
+    setApiError('');
+    setApiPending(true);
+    try {
+      const image_base64 = await encodeFrame(canvas);
+      if (!image_base64) throw new Error('encode failed');
+      const resp = await fetch('/api/analyze', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ image_base64, barcode: barcodeVal || undefined, use_model: true })
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      if (typeof data.score === 'number') {
+        setScore(prev => (prev == null || Math.abs(data.score - prev) >= 1 ? data.score : prev));
       }
-      cancelAnimationFrame(rafRef.current);
-    };
+      if (Array.isArray(data.pros)) setPros(data.pros.slice(0, 6));
+      if (Array.isArray(data.cons)) setCons(data.cons.slice(0, 6));
+      if (typeof data.confidence === 'number') setConfidence(Math.round(Math.min(100, Math.max(0, data.confidence))));
+      if (data.model) setApiModel(String(data.model).slice(0, 24));
+      setLastUpdate(new Date().toLocaleTimeString());
+      backoffRef.current = 0; // reset backoff
+    } catch (err) {
+      const prev = backoffRef.current || 2000;
+      backoffRef.current = Math.min(prev * 2, 60000);
+      setApiError(err.message || 'API error');
+    } finally {
+      setApiPending(false);
+    }
+  }, [apiMode, apiPending]);
+
+  // Delayed camera start until first interaction for better autoplay / speech compatibility
+  useEffect(() => {
+    // Autostart camera but handle failures gracefully
+    startCamera();
+    return () => stopCamera();
   }, []);
+
+  // Restart camera on orientation change (mobile stability)
+  useEffect(() => {
+    const handler = () => {
+      stopCamera();
+      startCamera();
+    };
+    window.addEventListener('orientationchange', handler);
+    return () => window.removeEventListener('orientationchange', handler);
+  }, []);
+
+  // Keyboard shortcuts (accessibility / power use): v=voice, s=snapshot, r=restart
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.target.tagName === 'INPUT') return;
+      if (e.key.toLowerCase() === 'v') toggleVoice();
+      if (e.key.toLowerCase() === 's') takeSnapshot();
+      if (e.key.toLowerCase() === 'r') { stopCamera(); startCamera(); }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [userActivatedAudio, voiceEnabled]);
+
+  const startCamera = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } },
+        audio: false,
+      });
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play();
+        setRunning(true);
+      }
+    } catch (err) {
+      console.error('camera error', err);
+      setPermissionError(err.message || String(err));
+    }
+  };
+
+  const stopCamera = () => {
+    if (videoRef.current && videoRef.current.srcObject) {
+      videoRef.current.srcObject.getTracks().forEach(t => t.stop());
+    }
+    cancelAnimationFrame(rafRef.current);
+  };
 
   // Core loop
   useEffect(() => {
     let last = 0;
-    const interval = 300; // ms between analyses
+    const interval = 400; // slower sampling to reduce fluctuations
 
     const step = (timestamp) => {
       if (!videoRef.current || videoRef.current.readyState < 2) {
@@ -85,6 +254,24 @@ export default function App() {
     return () => cancelAnimationFrame(rafRef.current);
   }, []);
 
+  // Initialize barcode reader lazily
+  const initBarcode = async () => {
+    if (barcodeReaderRef.current) return;
+    barcodeReaderRef.current = new BrowserMultiFormatReader();
+  };
+
+  const decodeBarcodeFromCanvas = (canvas) => {
+    if (!barcodeReaderRef.current) return;
+    try {
+      const luminanceSource = barcodeReaderRef.current.createLuminanceSource(canvas, canvas.width, canvas.height);
+      const binaryBitmap = barcodeReaderRef.current.createBinaryBitmap(luminanceSource);
+      const result = barcodeReaderRef.current.decodeBitmap(binaryBitmap);
+      if (result && result.getText && result.getText() !== barcode) {
+        setBarcode(result.getText());
+      }
+    } catch (_) { /* ignore no barcode */ }
+  };
+
   const captureAndAnalyze = () => {
     const video = videoRef.current;
     const canvas = canvasRef.current;
@@ -92,91 +279,90 @@ export default function App() {
     const w = video.videoWidth;
     const h = video.videoHeight;
     if (!w || !h) return;
+    // Use full frame for better signal (previously cropped center)
     canvas.width = w;
     canvas.height = h;
     const ctx = canvas.getContext('2d');
-    const sx = Math.floor(w * 0.25);
-    const sy = Math.floor(h * 0.25);
-    const sw = Math.floor(w * 0.5);
-    const sh = Math.floor(h * 0.5);
-    ctx.drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh);
+    ctx.drawImage(video, 0, 0, w, h, 0, 0, w, h);
 
-    const img = ctx.getImageData(0, 0, sw, sh);
-    const { data } = img;
-    let rSum = 0, gSum = 0, bSum = 0, count = 0;
-    const step = 4 * 6; // every 6th pixel
-    for (let i = 0; i < data.length; i += step) {
-      rSum += data[i];
-      gSum += data[i + 1];
-      bSum += data[i + 2];
-      count++;
-    }
-    const rAvg = rSum / count / 255;
-    const gAvg = gSum / count / 255;
-    const bAvg = bSum / count / 255;
+    // ImageData for analysis
+    const imgData = ctx.getImageData(0, 0, w, h);
 
-    const greenBias = gAvg;
-    const redPenalty = Math.max(0, rAvg - gAvg) * 0.5;
-    const bluePenalty = Math.max(0, bAvg - gAvg) * 0.2;
-    const rawScore = Math.max(0, greenBias - redPenalty - bluePenalty);
-    const mapped = greenToScore(rawScore);
-    const conf = Math.min(1, Math.abs(gAvg - (rAvg + bAvg) / 2) * 2);
+    const imageData = ctx.getImageData(0,0,w,h);
+    const analysis = analyzeImageData(imageData);
+    decodeBarcodeFromCanvas(canvas);
+    if (!analysis) return;
+    const { mappedScore, conf, lightingState, warnings: dynamicWarnings } = analysis;
 
-    const { pros: newPros, cons: newCons } = describeFromScore(mapped, conf);
-
-    setScore((prev) => {
-      if (prev === null || Math.abs(mapped - prev) >= 1) {
-        if (announceOnChange) speakScore(mapped);
+    // Stable update logic: require persistence of change
+    setScore(prev => {
+      if (prev === null || Math.abs(mappedScore - prev) >= 1) {
+        // track persistence
+        if (stableRef.current === mappedScore) {
+          consecutiveStableRef.current += 1;
+        } else {
+          stableRef.current = mappedScore;
+          consecutiveStableRef.current = 1;
+        }
+        if (voiceEnabled && userActivatedAudio && consecutiveStableRef.current >= 2 && mappedScore !== prev) {
+          speakScore(mappedScore);
+        }
+        return mappedScore;
+      } else {
+        // no big change; keep existing
+        return prev;
       }
-      return mapped;
     });
+
+    const { pros: newPros, cons: newCons } = describeFromScore(mappedScore, conf);
+
     setPros(newPros);
     setCons(newCons);
     setLastUpdate(new Date().toLocaleTimeString());
     setConfidence(Math.round(conf * 100));
+    setWarnings(dynamicWarnings);
+    // Attempt backend enrichment (throttled)
+    attemptApiAnalyze(canvas, barcode);
   };
 
   const describeFromScore = (s, conf) => {
     const pros = [];
     const cons = [];
     if (s >= 8) {
-      pros.push('High fresh/plant-based content');
-      pros.push('Low visible processing or additives');
-      cons.push('May be perishable — check storage');
+      pros.push('High natural indicators');
+      pros.push('Low visible processing');
+      cons.push('Perishable — ensure proper storage');
     } else if (s >= 6) {
-      pros.push('Moderately healthy choice');
-      pros.push('Likely contains real ingredients');
-      cons.push('May include added sugars or oils');
+      pros.push('Generally balanced visual profile');
+      pros.push('Some natural components evident');
+      cons.push('Possible added ingredients');
     } else if (s >= 4) {
-      pros.push('May contain some natural ingredients');
-      cons.push('Visible signs of processing or colouring');
-      cons.push('Check labels for additives');
+      pros.push('Contains mixed indicators');
+      cons.push('Signs of processing or additives');
+      cons.push('Review packaging details');
     } else {
-      pros.push('Convenient or tasty option');
-      cons.push('Likely highly processed');
-      cons.push('Higher sugar/sodium/fats possible');
+      pros.push('Convenient option');
+      cons.push('Likely processed');
+      cons.push('Check sugar / sodium / fats');
     }
-    if (conf * 100 < 30) cons.push('Low visual confidence — move closer');
+    if (conf * 100 < 50) cons.push('Low visual confidence — move closer / adjust lighting');
     return { pros, cons };
   };
 
   const speakScore = (s) => {
-    const text = `Health score ${s} out of 10`;
     try {
       const synth = window.speechSynthesis;
       if (!synth) return;
       synth.cancel();
-      const utter = new SpeechSynthesisUtterance(text);
-      utter.rate = 1.0;
-      utter.pitch = 1.0;
+      const utter = new SpeechSynthesisUtterance(`Health score ${s} out of 10`);
+      utter.rate = 1;
+      utter.pitch = 1;
+      utter.volume = 1;
       synth.speak(utter);
     } catch (e) {
       console.warn('TTS failed', e);
     }
   };
-
-  const formatPros = (items) => items.map((p, i) => <li key={i}>✅ {p}</li>);
-  const formatCons = (items) => items.map((c, i) => <li key={i}>⚠️ {c}</li>);
 
   const takeSnapshot = () => {
     const canvas = canvasRef.current;
@@ -187,95 +373,154 @@ export default function App() {
     link.click();
   };
 
+  const toggleVoice = () => {
+    setVoiceEnabled(v => !v);
+    if (!userActivatedAudio) setUserActivatedAudio(true); // first user interaction unlocks speech
+  };
+
+  const handleImageUpload = (e) => {
+    const file = e.target.files && e.target.files[0];
+    if(!file) return;
+    const img = new Image();
+    img.onload = () => {
+      const off = document.createElement('canvas');
+      const maxSide = 800;
+      let { width, height } = img;
+      if (width > maxSide || height > maxSide) {
+        const scale = Math.min(maxSide/width, maxSide/height);
+        width = Math.round(width*scale); height = Math.round(height*scale);
+      }
+      off.width = width; off.height = height;
+      const ictx = off.getContext('2d');
+      ictx.drawImage(img,0,0,width,height);
+      const imageData = ictx.getImageData(0,0,width,height);
+      const a = analyzeImageData(imageData);
+      if (a) {
+        // direct state updates (mirror live path)
+        const { mappedScore, conf, lightingState, warnings: dynamicWarnings } = a;
+        setScore(mappedScore);
+        const { pros: p, cons: c } = describeFromScore(mappedScore, conf);
+        setPros(p); setCons(c);
+        setConfidence(Math.round(conf*100));
+        setLighting(lightingState); setWarnings(dynamicWarnings);
+        setLastUpdate(new Date().toLocaleTimeString());
+      }
+      URL.revokeObjectURL(img.src);
+      initBarcode().then(()=> decodeBarcodeFromCanvas(off));
+    };
+    img.src = URL.createObjectURL(file);
+  };
+
+  useEffect(()=>{ initBarcode(); },[]);
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 to-indigo-900 text-white flex flex-col items-center p-4">
-      <div className="w-full max-w-3xl bg-white/5 rounded-2xl shadow-xl overflow-hidden border border-white/10">
+      <div className="w-full max-w-5xl bg-white/5 rounded-2xl shadow-xl overflow-hidden border border-white/10">
         <div className="flex flex-col md:flex-row">
           <div className="relative md:w-1/2">
-            <div className="absolute top-3 left-3 z-20 bg-black/40 p-2 rounded-md text-sm">Live Camera</div>
-            <video ref={videoRef} className="w-full h-72 object-cover bg-black" playsInline muted />
+            <div className="absolute top-3 left-3 z-20 bg-black/40 px-3 py-1 rounded-md text-sm">Live Scan</div>
+            <video
+              ref={videoRef}
+              className="w-full aspect-[3/4] md:aspect-auto md:h-full object-cover bg-black max-h-[70vh]"
+              playsInline
+              muted
+            />
             <canvas ref={canvasRef} className="hidden" />
-            <div className="absolute bottom-3 left-3 z-20 flex gap-2">
+            <div className="absolute bottom-3 left-3 z-20 flex flex-wrap gap-2">
               <button
-                onClick={() => setAnnounceOnChange((v) => !v)}
+                onClick={toggleVoice}
                 className="bg-white/10 px-3 py-1 rounded-md text-sm backdrop-blur"
               >
-                {announceOnChange ? 'Voice: On' : 'Voice: Off'}
+                {voiceEnabled ? 'Voice: On' : 'Voice: Off'}
               </button>
               <button onClick={takeSnapshot} className="bg-white/10 px-3 py-1 rounded-md text-sm">
                 Snapshot
               </button>
+              <button
+                onClick={() => { setApiMode(m => !m); if (!apiMode) { backoffRef.current = 0; lastApiRef.current = 0; }}}
+                className={`px-3 py-1 rounded-md text-sm backdrop-blur ${apiMode ? 'bg-indigo-600' : 'bg-white/10'}`}
+              >
+                {apiMode ? 'API: On' : 'API: Off'}
+              </button>
             </div>
           </div>
 
-          <div className="md:w-1/2 p-6">
-            <h2 className="text-2xl font-bold mb-1">Product Health Scanner</h2>
-            <div className="text-xs mb-3 opacity-70">Re-Engineered by Siddhant Wadhwani</div>
+          <div className="md:w-1/2 p-6 flex flex-col">
+            <h1 className="text-2xl font-bold mb-1">Product Health Scanner</h1>
+            <p className="text-sm opacity-80 mb-4">Point the camera at a product. A stabilized health score updates live.</p>
 
-            <p className="text-sm opacity-80 mb-4">Point your camera at a product. Health score updates live.</p>
-
-            <div className="flex items-center gap-4 mb-4">
-              <div className="w-28 h-28 rounded-full bg-white/5 flex items-center justify-center text-4xl font-bold animate-pulse">
+            <div className="flex items-center gap-4 mb-5">
+              <div
+                className="w-32 h-32 rounded-full bg-white/5 flex items-center justify-center text-4xl font-bold transition-colors"
+                aria-live="polite"
+              >
                 {score ?? '--'}
               </div>
 
               <div className="flex-1">
-                <div className="mb-2">Live description (animated)</div>
-                <div className="bg-white/6 p-3 rounded-lg min-h-[72px]">
-                  <div className={`transition-all duration-500 ease-out ${score >= 8 ? 'translate-x-0' : ''}`}>
-                    <strong className="block">{score !== null ? `Health score: ${score}/10` : 'Scanning...'}</strong>
-                    <div className="text-xs opacity-80">Confidence: {confidence}% • last: {lastUpdate ?? '–'}</div>
-                    <div className="mt-2 grid grid-cols-2 gap-2">
-                      <div>
-                        <div className="text-sm font-semibold">Pros</div>
-                        <ul className="text-xs mt-1 space-y-1">{formatPros(pros)}</ul>
-                      </div>
-                      <div>
-                        <div className="text-sm font-semibold">Cons</div>
-                        <ul className="text-xs mt-1 space-y-1">{formatCons(cons)}</ul>
-                      </div>
+                <div className="bg-white/10 p-4 rounded-lg min-h-[120px]">
+                  <strong className="block mb-1">{score !== null ? `Health score: ${score}/10` : 'Scanning...'}</strong>
+                  <div className="text-xs opacity-80 mb-2">Confidence: {confidence}% • Updated: {lastUpdate ?? '–'}</div>
+                  {apiMode && (
+                    <div className="flex items-center gap-2 mb-2 text-[10px]">
+                      <span className={`px-2 py-0.5 rounded ${apiPending ? 'bg-indigo-600 animate-pulse' : 'bg-white/10'}`}>{apiPending ? 'API…' : (apiModel || 'API')}</span>
+                      {apiError && <span className="text-red-400" title={apiError}>Err</span>}
+                      {!navigator.onLine && <span className="text-amber-400">Offline</span>}
+                    </div>
+                  )}
+                  <div className="grid grid-cols-2 gap-4 text-xs">
+                    <div>
+                      <div className="text-sm font-semibold mb-1">Pros</div>
+                      <ul className="space-y-1">
+                        {pros.map((p,i)=>(<li key={i}>✅ {p}</li>))}
+                      </ul>
+                    </div>
+                    <div>
+                      <div className="text-sm font-semibold mb-1">Cons</div>
+                      <ul className="space-y-1">
+                        {cons.map((c,i)=>(<li key={i}>⚠️ {c}</li>))}
+                      </ul>
                     </div>
                   </div>
                 </div>
               </div>
             </div>
 
-            <div className="mt-3 text-sm opacity-80">
-              <div className="mb-1">How it works (demo):</div>
-              <ul className="list-disc pl-5 space-y-1">
-                <li>Camera frames are analyzed in-browser using a green-channel heuristic (demo only).</li>
-                <li>Replace analysis with a Vision model backend for richer insights.</li>
-                <li>Use server-side TTS / ChatGPT Voice streaming for natural voice output.</li>
-              </ul>
-            </div>
-
-            <div className="mt-6 flex gap-3">
-              <button
-                onClick={() => alert('Replace with API integration: send canvas image to backend -> call OpenAI Vision')}
-                className="bg-indigo-600 px-4 py-2 rounded-md"
-              >
-                Integrate Vision API
-              </button>
-
-              <button
-                onClick={() => alert('Enhancements: barcode scan, nutrition DB, allergies, compare price')}
-                className="bg-white/6 px-4 py-2 rounded-md"
-              >
-                Show Enhancements
-              </button>
-            </div>
-
             {permissionError && (
-              <div className="mt-4 text-red-400">Camera error: {permissionError}</div>
+              <div className="mt-2 text-red-400 text-sm">Camera error: {permissionError}</div>
             )}
+            <div className="mt-auto text-[10px] tracking-wider text-white/30">© {new Date().getFullYear()}</div>
           </div>
         </div>
       </div>
 
-      <div className="max-w-3xl mt-6 text-xs text-white/60">
-        Tip: For improved results, point the camera at the product label and get closer. This demo uses heuristics — integrate a vision model for reliability.
+      <div className="max-w-5xl mt-4 text-xs text-white/60 text-center space-y-1">
+        <div>For best results: steady framing, diffuse lighting, move closer if confidence is low.</div>
+        {lighting && <div className="text-amber-300">Lighting: {lighting}</div>}
+        {warnings.length > 0 && (
+          <ul className="text-rose-300 space-y-0.5">{warnings.map((w,i)=><li key={i}>⚠️ {w}</li>)}</ul>
+        )}
+        {barcode && <div className="text-emerald-300">Barcode: {barcode}</div>}
       </div>
-      <div className="mt-4 text-[10px] uppercase tracking-wider text-white/30">Re-Engineered by Siddhant Wadhwani</div>
+      <div className="mt-4 text-[10px] opacity-40">Shortcuts: V=Voice S=Snapshot R=Restart</div>
+
+      {/* Manual image upload fallback */}
+      <div className="mt-6">
+        <label className="text-xs opacity-70 block mb-1">Upload image (fallback / analysis)</label>
+        <input type="file" accept="image/*" onChange={(e)=>handleImageUpload(e)} className="text-xs" />
+      </div>
     </div>
   );
+}
+
+// Image upload handler appended after component
+function handleImageUpload(e){
+  const file = e.target.files && e.target.files[0];
+  if(!file) return;
+  const img = new Image();
+  img.onload = () => {
+    // Could integrate a separate analysis path if needed
+    URL.revokeObjectURL(img.src);
+  };
+  img.src = URL.createObjectURL(file);
 }

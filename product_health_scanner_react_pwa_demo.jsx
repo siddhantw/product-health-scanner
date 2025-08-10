@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { BrowserMultiFormatReader } from '@zxing/browser';
 
 /**
  * Product Health Scanner - React PWA Demo
@@ -9,13 +10,7 @@ import React, { useEffect, useRef, useState } from 'react';
  *   (average green channel) to produce a live health score (1-10)
  * - Announces the score using Web Speech (SpeechSynthesis)
  * - Displays an animated UI with score, pros, cons; updates live
- *
- * Notes on real integrations:
- * - Replace `analyzeFrame` with a backend call to OpenAI's Vision model
- *   (send the frame image bytes, receive structured JSON: {score, pros, cons})
- * - For "ChatGPT Voice" playback you can either stream TTS from an API
- *   (if available), or continue using browser SpeechSynthesis for demoing.
- * - Add authentication, rate-limiting, and privacy handling when sending images.
+ * - Optional barcode scanning mode (ZXing) for future nutrition lookup
  */
 
 // Simple helper: map 0..1 to 1..10
@@ -35,7 +30,11 @@ export default function App() {
   const [lastUpdate, setLastUpdate] = useState(null);
   const [confidence, setConfidence] = useState(0);
   const [announceOnChange, setAnnounceOnChange] = useState(true);
+  const [barcodeMode, setBarcodeMode] = useState(false);
+  const [barcode, setBarcode] = useState(null);
+  const [networkOnline, setNetworkOnline] = useState(typeof navigator !== 'undefined' ? navigator.onLine : true);
   const rafRef = useRef(null);
+  const barcodeReaderRef = useRef(null);
 
   // Start camera
   useEffect(() => {
@@ -68,6 +67,47 @@ export default function App() {
       cancelAnimationFrame(rafRef.current);
     };
   }, []);
+
+  // Network status listener
+  useEffect(() => {
+    const onOnline = () => setNetworkOnline(true);
+    const onOffline = () => setNetworkOnline(false);
+    window.addEventListener('online', onOnline);
+    window.addEventListener('offline', onOffline);
+    return () => {
+      window.removeEventListener('online', onOnline);
+      window.removeEventListener('offline', onOffline);
+    };
+  }, []);
+
+  // Barcode scanning effect
+  useEffect(() => {
+    if (!barcodeMode) {
+      if (barcodeReaderRef.current) {
+        try { barcodeReaderRef.current.reset(); } catch (_) {}
+      }
+      return;
+    }
+    const start = async () => {
+      try {
+        const reader = new BrowserMultiFormatReader();
+        barcodeReaderRef.current = reader;
+        // Using video element ID for convenience
+        await reader.decodeFromVideoDevice(null, 'camera-feed', (result, err, controls) => {
+          if (result) {
+            const text = result.getText();
+            setBarcode(text);
+          }
+        });
+      } catch (e) {
+        console.warn('Barcode init failed', e);
+      }
+    };
+    start();
+    return () => {
+      try { barcodeReaderRef.current?.reset(); } catch (_) {}
+    };
+  }, [barcodeMode]);
 
   // Core loop: draw video to hidden canvas and analyze every N ms
   useEffect(() => {
@@ -204,6 +244,12 @@ export default function App() {
       console.warn('TTS failed', e);
     }
   };
+  const speakText = (t) => {
+    try {
+      const synth = window.speechSynthesis; if (!synth) return;
+      const utter = new SpeechSynthesisUtterance(t); synth.cancel(); synth.speak(utter);
+    } catch (_) {}
+  };
 
   // UI helpers
   const formatPros = (items) => items.map((p, i) => <li key={i}>✅ {p}</li>);
@@ -221,13 +267,19 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 to-indigo-900 text-white flex flex-col items-center p-4">
+      {/* Accessibility live region for score updates */}
+      <div className="sr-only" aria-live="polite">{score !== null ? `Health score ${score} out of 10` : 'Scanning'}</div>
+      {/* Network status banner */}
+      {!networkOnline && (
+        <div className="fixed top-2 right-2 bg-red-600/80 px-3 py-1 rounded text-xs shadow">Offline mode (cached)</div>
+      )}
       <div className="w-full max-w-3xl bg-white/5 rounded-2xl shadow-xl overflow-hidden border border-white/10">
         <div className="flex flex-col md:flex-row">
           <div className="relative md:w-1/2">
             <div className="absolute top-3 left-3 z-20 bg-black/40 p-2 rounded-md text-sm">Live Camera</div>
-            <video ref={videoRef} className="w-full h-72 object-cover bg-black" playsInline muted />
+            <video id="camera-feed" ref={videoRef} className="w-full h-72 object-cover bg-black" playsInline muted />
             <canvas ref={canvasRef} className="hidden" />
-            <div className="absolute bottom-3 left-3 z-20 flex gap-2">
+            <div className="absolute bottom-3 left-3 z-20 flex gap-2 flex-wrap pr-3">
               <button
                 onClick={() => setAnnounceOnChange((v) => !v)}
                 className="bg-white/10 px-3 py-1 rounded-md text-sm backdrop-blur"
@@ -237,7 +289,19 @@ export default function App() {
               <button onClick={takeSnapshot} className="bg-white/10 px-3 py-1 rounded-md text-sm">
                 Snapshot
               </button>
+              <button
+                onClick={() => setBarcodeMode((m) => !m)}
+                className={`px-3 py-1 rounded-md text-sm ${barcodeMode ? 'bg-indigo-600' : 'bg-white/10'}`}
+              >
+                {barcodeMode ? 'Stop Barcode' : 'Scan Barcode'}
+              </button>
             </div>
+            {barcode && (
+              <div className="absolute top-3 right-3 bg-black/60 rounded p-2 text-[10px] max-w-[140px] break-words">
+                <div className="font-semibold mb-1">Barcode</div>
+                <div>{barcode}</div>
+              </div>
+            )}
           </div>
 
           <div className="md:w-1/2 p-6">
@@ -256,6 +320,9 @@ export default function App() {
                   <div className={`transition-all duration-500 ease-out ${score >= 8 ? 'translate-x-0' : ''}`}>
                     <strong className="block">{score !== null ? `Health score: ${score}/10` : 'Scanning...'}</strong>
                     <div className="text-xs opacity-80">Confidence: {confidence}% • last: {lastUpdate ?? '–'}</div>
+                    {barcode && (
+                      <div className="mt-1 text-[10px] opacity-70">Detected barcode: {barcode}</div>
+                    )}
                     <div className="mt-2 grid grid-cols-2 gap-2">
                       <div>
                         <div className="text-sm font-semibold">Pros</div>
@@ -277,10 +344,11 @@ export default function App() {
                 <li>Camera frames are analyzed in-browser using a green-channel heuristic (demo only).</li>
                 <li>For production, replace analysis with OpenAI Vision model backend call to get richer insights.</li>
                 <li>Use server-side TTS / ChatGPT Voice streaming to produce natural voice output.</li>
+                <li>Optional barcode scan (ZXing) to link with nutrition databases (future).</li>
               </ul>
             </div>
 
-            <div className="mt-6 flex gap-3">
+            <div className="mt-6 flex gap-3 flex-wrap">
               <button
                 onClick={() => alert('Replace with API integration: send canvas image to backend -> call OpenAI Vision')}
                 className="bg-indigo-600 px-4 py-2 rounded-md"
